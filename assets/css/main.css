@@ -619,6 +619,10 @@ code {
   display: none;
 }
 
+.sidebar-edge-toggle {
+  display: none;
+}
+
 .main-content {
   min-height: 100vh;
   margin-left: var(--sidebar-width);
@@ -3957,6 +3961,63 @@ dialog.modal::backdrop {
 
   .chart-card:last-child .score-chart {
     max-width: 620px;
+  }
+}
+
+@media (min-width: 901px) {
+  .sidebar {
+    transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1), visibility 0s linear 0s;
+  }
+
+  .sidebar-edge-toggle {
+    position: fixed;
+    top: 14px;
+    left: calc(var(--sidebar-width) + 3px);
+    z-index: 45;
+    display: grid;
+    width: 27px;
+    height: 52px;
+    padding: 0;
+    place-items: center;
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: var(--shadow-sm);
+    cursor: pointer;
+    transition: left 260ms cubic-bezier(0.22, 1, 0.36, 1), color 160ms ease, border-color 160ms ease;
+  }
+
+  .sidebar-edge-toggle:hover {
+    color: var(--forest);
+    border-color: var(--forest-mid);
+  }
+
+  .sidebar-edge-toggle:focus-visible {
+    outline: 2px solid var(--gold);
+    outline-offset: 2px;
+  }
+
+  .sidebar-edge-toggle .icon {
+    transition: transform 220ms ease;
+  }
+
+  body:not(.sidebar-collapsed) .sidebar-edge-toggle .icon {
+    transform: rotate(180deg);
+  }
+
+  body.sidebar-collapsed .sidebar-edge-toggle {
+    left: 4px;
+  }
+
+  body.sidebar-collapsed .sidebar {
+    visibility: hidden;
+    transform: translateX(-100%);
+    transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1), visibility 0s linear 260ms;
+  }
+
+  body.sidebar-collapsed .main-content {
+    margin-left: 0;
   }
 }
 

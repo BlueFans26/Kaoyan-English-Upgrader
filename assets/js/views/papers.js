@@ -448,9 +448,11 @@ export function renderPapers(container, app, params = {}) {
           <span class="paper-text-label">${icon("bookOpen", 14)} ${label}</span>
           ${highlightToolbar(part)}
         </header>
-        <div class="paper-passage" data-paper-passage>
-          ${body}
-          <canvas class="paper-highlight-canvas" data-highlight-canvas aria-hidden="true"></canvas>
+        <div class="paper-passage-scroll" data-paper-passage-scroll>
+          <div class="paper-passage" data-paper-passage>
+            ${body}
+            <canvas class="paper-highlight-canvas" data-highlight-canvas aria-hidden="true"></canvas>
+          </div>
         </div>
         <p class="paper-highlight-hint" data-highlight-hint>${icon("info", 13)} 开启荧光笔后拖动勾画；关闭后可正常选词、点击空格。</p>
       </div>

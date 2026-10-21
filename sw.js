@@ -1,4 +1,4 @@
-const CACHE_NAME = "kao-yan-ying-yu-zong-he-bei-kao-zhan-v15";
+const CACHE_NAME = "kao-yan-ying-yu-zong-he-bei-kao-zhan-v16";
 const APP_SHELL = [
   "./",
   "./index.html",

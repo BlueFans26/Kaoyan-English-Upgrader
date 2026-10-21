@@ -41,6 +41,37 @@ const app = {
   reloadRecords,
 };
 
+const SIDEBAR_COLLAPSED_KEY = "yingyu-daguan.sidebar.collapsed.v1";
+
+function loadSidebarCollapsed() {
+  try {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+document.body.classList.toggle("sidebar-collapsed", loadSidebarCollapsed());
+
+function syncSidebarToggle() {
+  const collapsed = document.body.classList.contains("sidebar-collapsed");
+  const button = root.querySelector("[data-sidebar-toggle]");
+  if (!button) return;
+  button.setAttribute("aria-expanded", String(!collapsed));
+  button.setAttribute("aria-label", collapsed ? "展开侧栏" : "收起侧栏");
+  button.title = collapsed ? "展开侧栏" : "收起侧栏";
+}
+
+function setSidebarCollapsed(collapsed) {
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    // The in-memory state still applies when storage is unavailable.
+  }
+  syncSidebarToggle();
+}
+
 function shellMarkup() {
   return `<a class="skip-link" href="#page-content">跳到主要内容</a>
     <div class="mobile-topbar">
@@ -51,6 +82,7 @@ function shellMarkup() {
       </a>
       <button type="button" class="icon-btn" data-open-settings aria-label="打开设置">${icon("settings", 19)}</button>
     </div>
+    <button type="button" class="sidebar-edge-toggle" data-sidebar-toggle aria-label="收起侧栏" aria-expanded="true" aria-controls="app-sidebar" title="收起侧栏">${icon("chevronRight", 16)}</button>
     <div class="sidebar-backdrop" data-nav-close aria-hidden="true"></div>
     <aside class="sidebar" id="app-sidebar">
       <a class="brand" href="#/overview" aria-label="考研英语综合备考站首页">
@@ -324,6 +356,10 @@ function bindShellEvents() {
       app.openSettings();
       return;
     }
+    if (event.target.closest("[data-sidebar-toggle]")) {
+      setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
+      return;
+    }
     if (event.target.closest("[data-nav-toggle]")) {
       const isOpen = document.body.classList.toggle("nav-open");
       root.querySelector("[data-nav-toggle]")?.setAttribute("aria-expanded", String(isOpen));
@@ -345,6 +381,7 @@ function bindShellEvents() {
 async function boot() {
   root.innerHTML = shellMarkup();
   bindShellEvents();
+  syncSidebarToggle();
   updateApiStatus();
   try {
     state.records = await listRecords();
