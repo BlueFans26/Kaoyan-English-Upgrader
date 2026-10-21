@@ -1,0 +1,31 @@
+考研英语综合备考站 · 背单词词库说明
+========================================
+
+词表与释义
+- 来源：exam-data/NETEMVocabulary
+  https://github.com/exam-data/NETEMVocabulary
+- 内容：2024 年全国硕士研究生招生考试英语（一）考试大纲词汇表 5530 词，
+  按约 200 套试卷文本中的词频排序；英语（一）与英语（二）共用考试大纲词汇。
+- 许可：CC BY-NC-SA 4.0
+  https://creativecommons.org/licenses/by-nc-sa/4.0/
+- 本词库中的词表、释义与据此生成的易混选项数据同样以 CC BY-NC-SA 4.0 提供，
+  仅限非商业学习用途，并保留署名与相同方式共享要求。
+
+例句
+- 来源：Tatoeba
+  https://tatoeba.org
+- 许可：CC BY 2.0
+  https://creativecommons.org/licenses/by/2.0/
+- 每条词条例句保留 Tatoeba sentence ID；例句版权归各自贡献者。
+- 少量考纲词在 Tatoeba 中无合适例句，由本项目按学习场景补写，并标注为本站例句。
+
+音标与词形
+- 来源：ECDICT
+  https://github.com/skywind3000/ECDICT
+- 许可：MIT License，Copyright (c) 2025 Linwei
+
+易混选项
+- 由本项目基于上述词表、释义与拼写相似度自动生成，指向其他考纲单词，
+  不代表官方考试答案或词义辨析结论。
+
+本说明随词库文件一同分发；如再分发，请保留本说明与上述许可信息。

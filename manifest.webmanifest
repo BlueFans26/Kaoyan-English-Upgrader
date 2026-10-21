@@ -1,0 +1,38 @@
+{
+  "name": "考研英语综合备考站",
+  "short_name": "考研英语综合备考站",
+  "description": "考研英语考纲背单词、英语一/英语二客观题真题演练、英语二翻译、小作文与大作文 AI 批改与练习，离线可用。",
+  "lang": "zh-CN",
+  "start_url": "./#/overview",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f4f1ea",
+  "theme_color": "#1c382f",
+  "icons": [
+    {
+      "src": "./icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
