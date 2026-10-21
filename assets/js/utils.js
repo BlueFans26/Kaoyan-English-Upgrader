@@ -317,41 +317,214 @@ function normalizeNote(note) {
   return { sentence, why };
 }
 
+function sanitizeJsonControlChars(text) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+  for (const char of text) {
+    if (!inString) {
+      result += char;
+      if (char === '"') inString = true;
+      continue;
+    }
+    if (escaped) {
+      result += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      result += char;
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      result += char;
+      inString = false;
+      continue;
+    }
+    if (char === "\n") {
+      result += "\\n";
+      continue;
+    }
+    if (char === "\r") {
+      result += "\\r";
+      continue;
+    }
+    if (char === "\t") {
+      result += "\\t";
+      continue;
+    }
+    if (char.charCodeAt(0) < 0x20) {
+      result += `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
+      continue;
+    }
+    result += char;
+  }
+  return result;
+}
+
+function scanJsonPrefix(text) {
+  const stack = [];
+  const commas = [];
+  let inString = false;
+  let escaped = false;
+  let stringIsKey = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      const container = stack[stack.length - 1];
+      if (container === "{") {
+        let previous = index - 1;
+        while (previous >= 0 && /\s/.test(text[previous])) previous -= 1;
+        stringIsKey = previous < 0 || text[previous] === "{" || text[previous] === ",";
+      } else {
+        stringIsKey = false;
+      }
+      continue;
+    }
+    if (char === "{" || char === "[") {
+      stack.push(char);
+      continue;
+    }
+    if (char === "}" || char === "]") {
+      stack.pop();
+      continue;
+    }
+    if (char === ",") {
+      commas.push({ index, stack: [...stack] });
+    }
+  }
+
+  return { stack, commas, inString, escaped, stringIsKey };
+}
+
+function closeJsonContainers(stack) {
+  return stack
+    .slice()
+    .reverse()
+    .map((type) => (type === "{" ? "}" : "]"))
+    .join("");
+}
+
+function closeJsonAtEnd(source, scan) {
+  let base = source;
+  if (scan.inString) {
+    if (scan.stringIsKey) return "";
+    if (scan.escaped) {
+      base = base.slice(0, -1);
+    } else {
+      const partialUnicode = base.match(/\\u[0-9a-fA-F]{0,3}$/);
+      if (partialUnicode) base = base.slice(0, -partialUnicode.length);
+    }
+    base += '"';
+  } else {
+    base = base.trimEnd();
+    if (base.endsWith(",")) base = base.slice(0, -1).trimEnd();
+    if (base.endsWith(":")) return "";
+  }
+  if (!base) return "";
+  return `${base}${closeJsonContainers(scan.stack)}`;
+}
+
+function repairTruncatedJson(text) {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let source = text.slice(start).replace(/```[\s\S]*$/, "").trimEnd();
+  if (!source) return null;
+  source = sanitizeJsonControlChars(source);
+  const scan = scanJsonPrefix(source);
+
+  const closed = closeJsonAtEnd(source, scan);
+  if (closed) {
+    try {
+      const data = JSON.parse(closed);
+      if (data && typeof data === "object" && Object.keys(data).length) return data;
+    } catch {
+      // Try trimming back to the last complete value below.
+    }
+  }
+
+  const maxAttempts = Math.min(scan.commas.length, 80);
+  for (let offset = 1; offset <= maxAttempts; offset += 1) {
+    const checkpoint = scan.commas[scan.commas.length - offset];
+    const base = source.slice(0, checkpoint.index).trimEnd();
+    if (!base || base.endsWith(":")) continue;
+    try {
+      const data = JSON.parse(`${base}${closeJsonContainers(checkpoint.stack)}`);
+      if (data && typeof data === "object" && Object.keys(data).length) return data;
+    } catch {
+      // Try an earlier comma.
+    }
+  }
+  return null;
+}
+
+function balancedObjectEnd(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
 function extractJson(raw) {
   if (typeof raw !== "string") return null;
   let text = raw.replace(/^\uFEFF/, "").trim();
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced) text = fenced[1].trim();
   try {
-    return JSON.parse(text);
+    return { data: JSON.parse(text), truncated: false };
   } catch {
-    // Try the first balanced JSON object in the response.
+    // Try structured extraction and truncated-output repair below.
   }
+
+  const firstBrace = text.indexOf("{");
+  if (firstBrace !== -1) {
+    const end = balancedObjectEnd(text, firstBrace);
+    if (end !== -1) {
+      try {
+        return { data: JSON.parse(text.slice(firstBrace, end + 1)), truncated: false };
+      } catch {
+        // Fall through to truncated-output repair.
+      }
+    }
+    const salvaged = repairTruncatedJson(text.slice(firstBrace));
+    if (salvaged) return { data: salvaged, truncated: true };
+  }
+
   for (let start = 0; start < text.length; start += 1) {
     if (text[start] !== "{") continue;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let index = start; index < text.length; index += 1) {
-      const char = text[index];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (char === "\\") escaped = true;
-        else if (char === '"') inString = false;
-        continue;
-      }
-      if (char === '"') inString = true;
-      else if (char === "{") depth += 1;
-      else if (char === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          try {
-            return JSON.parse(text.slice(start, index + 1));
-          } catch {
-            break;
-          }
-        }
-      }
+    const end = balancedObjectEnd(text, start);
+    if (end === -1) continue;
+    try {
+      return { data: JSON.parse(text.slice(start, end + 1)), truncated: false };
+    } catch {
+      // Keep scanning for another complete object.
     }
   }
   return null;
@@ -395,7 +568,7 @@ function parseMarkdownTable(raw) {
 function findScoreInText(raw, total) {
   const patterns = [
     /(?:最终得分|总得分)\s*[：:]\s*(\d+(?:\.\d+)?)/,
-    /(?:得分|分数|score)\s*[：:]\s*(\d+(?:\.\d+)?)/i,
+    /["']?(?:得分|分数|score)["']?\s*[：:]\s*(\d+(?:\.\d+)?)/i,
     /(\d+(?:\.\d+)?)\s*(?:\/|／)\s*(?:10|15)(?!\d)/,
   ];
   for (const pattern of patterns) {
@@ -513,19 +686,23 @@ function normalizeResultObject(data, subject) {
   return result;
 }
 
-export function parseModelOutput(raw, subject) {
-  const data = extractJson(raw);
+export function parseModelOutput(raw, subject, options = {}) {
+  const extracted = extractJson(raw);
+  const data = extracted?.data;
+  const truncated = options.truncated === true || extracted?.truncated === true;
   if (data && typeof data === "object" && !Array.isArray(data)) {
     const payload = data.result || data.grading || data.data || data;
     const normalized = normalizeResultObject(payload, subject);
     if (normalized.score !== undefined) {
-      return { ...normalized, parsed: true, raw: String(raw || "") };
+      return { ...normalized, parsed: true, truncated, raw: String(raw || "") };
     }
   }
 
   const rows = parseMarkdownTable(raw);
   const score = findScoreInText(raw, subject.total);
-  const deductionMatch = String(raw || "").match(/(?:总扣分|扣分合计|共扣)\s*[：:]?\s*(\d+(?:\.\d+)?)/);
+  const deductionMatch = String(raw || "").match(
+    /(?:总扣分|扣分合计|共扣|["']?totalDeduction["']?)\s*[：:]?\s*(\d+(?:\.\d+)?)/i,
+  );
   const totalDeduction = deductionMatch
     ? clamp(roundScore(Number(deductionMatch[1])), 0, subject.total)
     : undefined;
@@ -543,6 +720,7 @@ export function parseModelOutput(raw, subject) {
       totalDeduction ??
       (resolvedScore !== undefined ? clamp(roundScore(subject.total - resolvedScore), 0, subject.total) : undefined),
     parsed: false,
+    truncated,
     raw: String(raw || ""),
   };
 }

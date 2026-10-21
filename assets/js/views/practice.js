@@ -261,9 +261,13 @@ function renderSample(result, subject) {
 }
 
 function renderRaw(result) {
-  if (!result.raw || result.parsed !== false) return "";
+  if (!result.raw || (result.parsed !== false && result.truncated !== true)) return "";
+  const message =
+    result.truncated === true
+      ? "AI 输出在模型长度上限处被截断，页面已解析并展示可用的部分。原始输出保留在下方，便于排查或复制。"
+      : "AI 返回内容未完全遵循结构化格式。页面已尽力解析可见信息，原始输出保留在下方，便于排查或复制。";
   return `<section class="review-card raw-card">
-    <div class="inline-notice is-warning">${icon("alert", 18)}<p>AI 返回内容未完全遵循结构化格式。页面已尽力解析可见信息，原始输出保留在下方，便于排查或复制。</p></div>
+    <div class="inline-notice is-warning">${icon("alert", 18)}<p>${message}</p></div>
     <details class="raw-response">
       <summary>查看 AI 原始返回 ${icon("chevronDown", 15)}</summary>
       <pre>${escapeHTML(result.raw)}</pre>
@@ -338,8 +342,12 @@ export function renderPractice(container, app, subjectKey, params = {}) {
   const weaknesses = Array.isArray(result.weaknesses) ? result.weaknesses.filter(Boolean) : [];
   const hasRows = Array.isArray(result.sentenceRows) && result.sentenceRows.length > 0;
   const parseWarning =
-    result.parsed === false
+    result.parsed === false && result.truncated !== true
       ? `<div class="inline-notice is-warning">${icon("alert", 18)}<p>AI 返回内容未完全结构化，得分与逐句信息可能不完整。请查看原始返回，或换用支持稳定 JSON 输出的模型重试。</p></div>`
+      : "";
+  const truncatedNotice =
+    result.truncated === true
+      ? `<div class="inline-notice is-warning">${icon("alert", 18)}<p>AI 输出达到了模型长度上限，页面已展示可解析的部分；总评、逐句明细或范文可能不完整。建议换用输出上限更高或非推理模型重新批改。</p></div>`
       : "";
   const summaryText = result.summary || "本次批改没有返回文字总评。";
   const optimization = renderOptimization(result, subject);
@@ -404,11 +412,12 @@ export function renderPractice(container, app, subjectKey, params = {}) {
 
           ${renderRecordContext(record, subject)}
           ${parseWarning}
+          ${truncatedNotice}
           ${renderSentenceTable(record, result, subject)}
           ${optimization}
           ${sample}
           ${raw}
-          ${!hasRows && result.parsed !== false ? `<div class="inline-notice is-soft">${icon("info", 16)}<p>这份记录的逐句明细为空，可能是模型未返回完整表格。你可以删除后重新批改。</p></div>` : ""}
+          ${!hasRows && result.parsed !== false && result.truncated !== true ? `<div class="inline-notice is-soft">${icon("info", 16)}<p>这份记录的逐句明细为空，可能是模型未返回完整表格。你可以删除后重新批改。</p></div>` : ""}
         </div>
       </div>
     </div>`;

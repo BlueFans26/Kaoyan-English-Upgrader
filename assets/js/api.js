@@ -4,6 +4,7 @@ const CONFIG_KEY = "yingyu-daguan.api.v1";
 const REQUEST_TIMEOUT = 240000;
 const GRADING_MAX_TOKENS = 5000;
 const GRADING_TOKEN_LADDER = [5000, 8192, 16384];
+const CONNECTION_TEST_MAX_TOKENS = 4096;
 
 export const DEFAULT_API_CONFIG = {
   baseUrl: "",
@@ -243,9 +244,13 @@ function outputBudgets(start, escalate) {
   return budgets;
 }
 
+function isOutputLimit(finishReason) {
+  return finishReason === "length" || finishReason === "max_tokens";
+}
+
 function outputLimitError({ finishReason, tokenBudget, hasReasoning }) {
-  if (finishReason === "length") {
-    return `AI 在 ${tokenBudget} tokens 的输出上限内没有生成批改内容（length）${
+  if (isOutputLimit(finishReason)) {
+    return `AI 在 ${tokenBudget} tokens 的输出上限内没有生成有效内容（length）${
       hasReasoning ? "，模型的思考过程已占满输出额度" : ""
     }。请重试；若持续出现，请换用输出上限更高的模型或非推理模型。`;
   }
@@ -281,6 +286,7 @@ async function chatRequest(config, {
   const budgets = outputBudgets(maxTokens, escalateOnLength);
   let budgetIndex = 0;
   let useJsonMode = jsonMode;
+  let lastPartial = null;
 
   try {
     let lastError;
@@ -307,12 +313,14 @@ async function chatRequest(config, {
       } catch (error) {
         if (error?.name === "AbortError") {
           if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+          if (lastPartial) return lastPartial;
           throw new AIRequestError(
             timeoutFired
               ? "等待 AI 响应超时。可以稍后重试，或换用响应更快的模型。"
               : "请求被中止。",
           );
         }
+        if (lastPartial) return lastPartial;
         throw new AIRequestError(
           "无法连接 AI 接口。请检查网络、Endpoint 地址，以及服务商是否允许浏览器跨域访问（CORS）。",
           { detail: error?.message || "" },
@@ -336,11 +344,16 @@ async function chatRequest(config, {
           budgetIndex > 0 &&
           /max_tokens|max_completion_tokens|maximum\s+(?:completion\s+)?tokens|too\s+(?:large|long)|exceed/i.test(detail);
         if (budgetRejected) {
+          if (lastPartial) {
+            lastPartial.retryRejected = true;
+            return lastPartial;
+          }
           throw new AIRequestError(
             `接口拒绝了 ${tokenBudget} tokens 的输出上限。请换用支持更长输出的模型，或稍后重试。${detail ? ` ${detail}` : ""}`,
             { status: response.status, detail },
           );
         }
+        if (lastPartial) return lastPartial;
         throw lastError;
       }
 
@@ -348,26 +361,41 @@ async function chatRequest(config, {
       try {
         data = await response.json();
       } catch {
+        if (lastPartial) return lastPartial;
         throw new AIRequestError("AI 返回了无法解析的响应。请重试或更换模型。");
       }
       const content = responseContent(data);
       const finishReason = data?.choices?.[0]?.finish_reason;
-      if (!content) {
-        if (escalateOnLength && finishReason === "length" && budgetIndex + 1 < budgets.length) {
+      const hitOutputLimit = isOutputLimit(finishReason);
+      const result = {
+        content,
+        usage: data.usage || null,
+        responseModel: data.model || config.model,
+        finishReason,
+        tokenBudget,
+        truncated: hitOutputLimit,
+        raw: data,
+      };
+      if (!content.trim()) {
+        if (escalateOnLength && hitOutputLimit && budgetIndex + 1 < budgets.length) {
           budgetIndex += 1;
           useJsonMode = false;
           continue;
         }
-        const hasReasoning = Boolean(data?.choices?.[0]?.message?.reasoning_content);
+        if (lastPartial && hitOutputLimit) return lastPartial;
+        const message = data?.choices?.[0]?.message;
+        const hasReasoning = Boolean(message?.reasoning_content || message?.reasoning);
         throw new AIRequestError(outputLimitError({ finishReason, tokenBudget, hasReasoning }));
       }
-      return {
-        content,
-        usage: data.usage || null,
-        responseModel: data.model || config.model,
-        raw: data,
-      };
+      if (escalateOnLength && hitOutputLimit && budgetIndex + 1 < budgets.length) {
+        lastPartial = result;
+        budgetIndex += 1;
+        useJsonMode = false;
+        continue;
+      }
+      return result;
     }
+    if (lastPartial) return lastPartial;
     throw lastError || new AIRequestError("AI 接口请求失败。");
   } finally {
     clearTimeout(timeout);
@@ -375,9 +403,19 @@ async function chatRequest(config, {
   }
 }
 
-function needsJsonRepair(content, subject) {
-  const parsed = parseModelOutput(content, subject);
-  return parsed.parsed !== true || !Number.isFinite(parsed.score);
+function parsedNeedsRepair(parsed) {
+  return parsed.parsed !== true || !Number.isFinite(parsed.score) || parsed.truncated === true;
+}
+
+function parsedRichness(parsed) {
+  if (parsed.parsed !== true || !Number.isFinite(parsed.score)) return -1;
+  return (
+    parsed.sentenceRows.length * 10 +
+    parsed.optimizations.length * 2 +
+    parsed.weaknesses.length +
+    (parsed.summary ? 1 : 0) +
+    (parsed.sampleEssay ? 1 : 0)
+  );
 }
 
 export async function gradeSubmission(options) {
@@ -405,7 +443,9 @@ export async function gradeSubmission(options) {
     jsonMode: true,
     escalateOnLength: true,
   });
-  if (!needsJsonRepair(response.content, subject)) return response;
+  const firstParsed = parseModelOutput(response.content, subject);
+  if (!response.truncated && !parsedNeedsRepair(firstParsed)) return response;
+  if (response.retryRejected) return response;
 
   try {
     const repaired = await chatRequest(config, {
@@ -415,15 +455,23 @@ export async function gradeSubmission(options) {
         {
           role: "user",
           content:
-            `你上一条回复无法被页面解析。请把它整理成系统提示中指定的 JSON 对象：只返回合法 JSON，不要代码块、标题、表格或解释；字段名与模板完全一致，必须包含 0 到 ${subject.total} 之间的数值型 score，并保留原有的逐句批改、总评与薄弱点信息。`,
+            `你上一条回复无法被页面解析${response.truncated ? "或输出被截断" : ""}。请把它整理成系统提示中指定的 JSON 对象：只返回合法 JSON，不要代码块、标题、表格或解释；字段名与模板完全一致，必须包含 0 到 ${subject.total} 之间的数值型 score，并保留原有的逐句批改、总评与薄弱点信息。`,
         },
       ],
-      maxTokens: 8192,
+      maxTokens: Math.max(8192, Number(response.tokenBudget) || 0),
       signal,
       jsonMode: true,
       escalateOnLength: true,
     });
-    if (!needsJsonRepair(repaired.content, subject)) return repaired;
+    const repairedParsed = parseModelOutput(repaired.content, subject);
+    if (repairedParsed.parsed === true && Number.isFinite(repairedParsed.score)) {
+      const repairedTruncated = repaired.truncated || repairedParsed.truncated === true;
+      if (firstParsed.parsed !== true) return repaired;
+      const firstRichness = parsedRichness(firstParsed);
+      const repairedRichness = parsedRichness(repairedParsed);
+      if (repairedRichness > firstRichness) return repaired;
+      if (repairedRichness === firstRichness && !repairedTruncated) return repaired;
+    }
   } catch (error) {
     if (error?.name === "AbortError" || signal?.aborted) throw error;
   }
@@ -439,8 +487,9 @@ export async function testApiConnection(config) {
   ];
   const result = await chatRequest(config, {
     messages,
-    maxTokens: 16,
+    maxTokens: CONNECTION_TEST_MAX_TOKENS,
     jsonMode: false,
+    escalateOnLength: true,
   });
   return result;
 }

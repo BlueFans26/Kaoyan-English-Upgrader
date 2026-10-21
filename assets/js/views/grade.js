@@ -477,7 +477,9 @@ export function renderGrade(container, app, subjectKey) {
         config: app.state.config,
         signal: activeAbort.signal,
       });
-      const parsed = parseModelOutput(response.content, subject);
+      const parsed = parseModelOutput(response.content, subject, {
+        truncated: response.truncated === true,
+      });
       const generatedAt = new Date();
       const record = {
         version: 1,
@@ -512,7 +514,11 @@ export function renderGrade(container, app, subjectKey) {
       draft.answerText = "";
       draft.error = "";
       if (Number.isFinite(parsed.score)) {
-        toast("批改完成，记录已保存。");
+        if (parsed.truncated) {
+          toast("批改完成，但模型输出达到长度上限；已保存可解析的部分，建议换用输出上限更高的模型重试。", "info");
+        } else {
+          toast("批改完成，记录已保存。");
+        }
       } else {
         toast("批改完成，但模型返回格式不完整；原始输出已保留，可在练习页查看。", "info");
       }
