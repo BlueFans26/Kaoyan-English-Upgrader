@@ -9,6 +9,12 @@ import {
   uid,
 } from "../utils.js";
 import { icon, openProgressDialog, toast } from "../ui.js";
+import {
+  attachSubjectiveTimer,
+  detachTimer,
+  finalizeSubjectiveTimer,
+  pauseActiveTimer,
+} from "../timer.js";
 
 const MAX_ANSWER_IMAGES = 5;
 
@@ -454,6 +460,7 @@ export function renderGrade(container, app, subjectKey) {
       if (draft.error) toast(draft.error, "error");
       return;
     }
+    pauseActiveTimer();
     submitting = true;
     activeAbort = new AbortController();
     showProgress();
@@ -480,6 +487,7 @@ export function renderGrade(container, app, subjectKey) {
       const parsed = parseModelOutput(response.content, subject, {
         truncated: response.truncated === true,
       });
+      const answerTiming = finalizeSubjectiveTimer(subjectKey);
       const generatedAt = new Date();
       const record = {
         version: 1,
@@ -505,6 +513,9 @@ export function renderGrade(container, app, subjectKey) {
         model: response.responseModel || app.state.config.model,
         usage: response.usage || null,
         durationMs: Date.now() - startedAt,
+        answerStartedAt: answerTiming.startedAt,
+        answerDurationMs: answerTiming.durationMs,
+        answerDurationValid: answerTiming.valid,
         createdAt: generatedAt.toISOString(),
       };
       finishProgress();
@@ -513,14 +524,24 @@ export function renderGrade(container, app, subjectKey) {
       draft.answerImages = [];
       draft.answerText = "";
       draft.error = "";
+      const timingNote =
+        answerTiming.valid === false
+          ? "本次作答不足 5 分钟，可能为“答案对照”环节，不计入有效作答时间。"
+          : "";
       if (Number.isFinite(parsed.score)) {
         if (parsed.truncated) {
-          toast("批改完成，但模型输出达到长度上限；已保存可解析的部分，建议换用输出上限更高的模型重试。", "info");
+          toast(
+            `批改完成，但模型输出达到长度上限；已保存可解析的部分，建议换用输出上限更高的模型重试。${timingNote}`,
+            "info",
+          );
         } else {
-          toast("批改完成，记录已保存。");
+          toast(`批改完成，记录已保存。${timingNote}`, timingNote ? "info" : "success");
         }
       } else {
-        toast("批改完成，但模型返回格式不完整；原始输出已保留，可在练习页查看。", "info");
+        toast(
+          `批改完成，但模型返回格式不完整；原始输出已保留，可在练习页查看。${timingNote}`,
+          "info",
+        );
       }
       app.navigate(`/practice/${subjectKey}?record=${encodeURIComponent(record.id)}`);
     } catch (error) {
@@ -615,11 +636,16 @@ export function renderGrade(container, app, subjectKey) {
   );
 
   renderForm();
+  attachSubjectiveTimer({
+    subjectKey,
+    title: subject.gradeTitle,
+  });
 
   return () => {
     disposed = true;
     controller.abort();
     activeAbort?.abort();
     finishProgress();
+    detachTimer();
   };
 }

@@ -1,6 +1,14 @@
 import { isApiConfigured } from "../api.js";
-import { renderScoreChart } from "../charts.js";
+import { renderObjectiveChart, renderScoreChart } from "../charts.js";
 import { MODE_LABELS, SUBJECT_ORDER, SUBJECTS } from "../data.js";
+import { listPaperStates, savePaperState } from "../db.js";
+import {
+  examSubjectMeta,
+  loadPaper,
+  loadPaperManifest,
+  papersForSubject,
+} from "../papers.js";
+import { PAPER_OVERTIME_MS } from "../timer.js";
 import { icon } from "../ui.js";
 import {
   averageScore,
@@ -18,6 +26,167 @@ function greeting() {
   if (hour < 12) return "早上好，开始今天的练习";
   if (hour < 18) return "下午好，留一点时间给表达";
   return "晚上好，把今天写下的再读一遍";
+}
+
+function validSummary(summary) {
+  return (
+    summary &&
+    Number.isFinite(Number(summary.score)) &&
+    Number.isFinite(Number(summary.maxScore)) &&
+    Number(summary.maxScore) > 0
+  );
+}
+
+function timeValue(value) {
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
+function summaryFromPaper(paperData, state) {
+  const answers = state.answers && typeof state.answers === "object" ? state.answers : {};
+  let score = 0;
+  let maxScore = 0;
+  let correct = 0;
+  let questionCount = 0;
+  for (const part of paperData.parts || []) {
+    const partAnswers =
+      answers[part.key] && typeof answers[part.key] === "object" ? answers[part.key] : {};
+    maxScore += Number(part.maxScore) || 0;
+    for (const question of part.questions || []) {
+      questionCount += 1;
+      if (partAnswers[question.number] === question.answer) {
+        correct += 1;
+        score += Number(question.score) || 0;
+      }
+    }
+  }
+  const totalMs = Math.round(Number(state.timing?.totalMs) || 0);
+  const timed = Boolean(state.timing?.startedAt) && Number.isFinite(Number(state.timing?.totalMs));
+  return {
+    score,
+    maxScore,
+    correct,
+    questionCount,
+    submittedAt: state.updatedAt || new Date().toISOString(),
+    durationMs: timed ? totalMs : null,
+    overtime: timed ? totalMs > PAPER_OVERTIME_MS : null,
+  };
+}
+
+function objectiveCardMarkup(subject) {
+  return `<article class="chart-card subject-objective" data-objective-card>
+    <header class="chart-card-head">
+      <span class="subject-emblem">${icon("target", 20)}</span>
+      <div class="chart-card-title">
+        <h3>客观题 · ${escapeHTML(subject.short)}</h3>
+        <p data-objective-total>${escapeHTML(subject.name)} · 整卷满分 60 分</p>
+      </div>
+      <div class="chart-latest">
+        <span>最近整卷</span>
+        <strong data-objective-latest>—</strong>
+      </div>
+    </header>
+    <div class="chart-metrics">
+      <span data-objective-average>平均 <strong>—</strong> 分</span>
+      <span data-objective-count>等待整套提交</span>
+    </div>
+    <div class="objective-chart-slot" data-objective-chart>
+      <div class="chart-loading"><span class="loading-orbit" aria-hidden="true"></span><span>正在读取整卷记录…</span></div>
+    </div>
+    <footer class="chart-card-foot">
+      <span class="legend-average"><i></i> 历年整卷均分</span>
+      <span data-objective-foot>仅统计完整提交的整卷</span>
+    </footer>
+  </article>`;
+}
+
+async function hydrateObjectiveCard(card, subject, isDisposed) {
+  const chartSlot = card.querySelector("[data-objective-chart]");
+  const latestValue = card.querySelector("[data-objective-latest]");
+  const averageValue = card.querySelector("[data-objective-average]");
+  const countValue = card.querySelector("[data-objective-count]");
+  const totalCopy = card.querySelector("[data-objective-total]");
+  const foot = card.querySelector("[data-objective-foot]");
+  const manifest = await loadPaperManifest();
+  if (isDisposed()) return;
+  const papers = papersForSubject(manifest, subject.key);
+  const metaById = new Map(papers.map((entry) => [entry.id, entry]));
+  const total = Math.max(0, ...papers.map((entry) => Number(entry.maxScore) || 0)) || 60;
+  if (totalCopy) totalCopy.textContent = `${subject.name} · 整卷满分 ${formatScore(total)} 分`;
+  const states = await listPaperStates();
+  if (isDisposed()) return;
+
+  const rows = [];
+  for (const state of states) {
+    if (!state?.id || !metaById.has(state.id)) continue;
+    const paperMeta = metaById.get(state.id);
+    let summary = state.summary;
+    if (!validSummary(summary)) {
+      const submittedCount = Object.values(state.submitted || {}).filter(Boolean).length;
+      if (submittedCount < 6) continue;
+      let paperData;
+      try {
+        paperData = await loadPaper(state.id);
+      } catch (error) {
+        console.warn("无法补全整卷记录：", state.id, error);
+        continue;
+      }
+      if (isDisposed()) return;
+      if (!(paperData.parts || []).every((part) => state.submitted?.[part.key])) continue;
+      summary = summaryFromPaper(paperData, state);
+      try {
+        await savePaperState({ ...state, summary });
+      } catch (error) {
+        console.warn("无法保存补全的整卷记录：", state.id, error);
+      }
+      if (isDisposed()) return;
+    }
+    rows.push({
+      id: state.id,
+      year: Number(paperMeta.year),
+      score: Number(summary.score),
+      maxScore: Number(summary.maxScore),
+      submittedAt: summary.submittedAt || state.updatedAt || null,
+    });
+  }
+
+  const byYear = new Map();
+  for (const row of rows) {
+    const existing = byYear.get(row.year);
+    if (!existing || timeValue(row.submittedAt) > timeValue(existing.submittedAt)) {
+      byYear.set(row.year, row);
+    }
+  }
+  const points = [...byYear.values()].sort((a, b) => a.year - b.year);
+  const latest = [...points].sort((a, b) => timeValue(b.submittedAt) - timeValue(a.submittedAt))[0] || null;
+  const average = points.length
+    ? points.reduce((sum, point) => sum + Number(point.score), 0) / points.length
+    : null;
+
+  if (latestValue) {
+    latestValue.innerHTML = latest
+      ? `${formatScore(latest.score)}<small>/${formatScore(latest.maxScore)}</small>`
+      : "—";
+  }
+  if (averageValue) {
+    averageValue.innerHTML = `平均 <strong>${average === null ? "—" : formatScore(average)}</strong> 分`;
+  }
+  if (countValue) {
+    countValue.textContent = points.length
+      ? `${points.length} 个年份 · ${rows.length} 套完整整卷`
+      : "等待整套提交";
+  }
+  if (foot) {
+    foot.textContent =
+      latest && timeValue(latest.submittedAt)
+        ? `最近 ${formatDayLabel(latest.submittedAt)}`
+        : "仅统计完整提交的整卷";
+  }
+  if (isDisposed()) return;
+  chartSlot.innerHTML = renderObjectiveChart(points, {
+    subjectName: subject.name,
+    total,
+  });
 }
 
 function renderSubjectChart(records, subject) {
@@ -97,6 +266,7 @@ export function renderDashboard(container, app) {
   const streak = computeStreak(records);
   const weekCount = countThisWeek(records);
   const latest = records[0];
+  const examSubject = examSubjectMeta(app.state.examSubject);
 
   container.innerHTML = `
     <div class="page dashboard-page">
@@ -104,7 +274,7 @@ export function renderDashboard(container, app) {
         <div class="page-head-copy">
           <span class="eyebrow">YOUR STUDY DESK / 学习总览</span>
           <h1>学习总览</h1>
-          <p>三条曲线，记录你在翻译与写作上的每一步。</p>
+          <p>四条曲线，记录你在客观题与主观题上的每一步。</p>
         </div>
         <div class="page-head-actions">
           <a href="#/grade/translation" class="btn btn-primary">${icon("plus", 17)} 开始批改</a>
@@ -174,9 +344,10 @@ export function renderDashboard(container, app) {
             <span class="eyebrow">PROGRESS CURVES</span>
             <h2>历史评分曲线</h2>
           </div>
-          <p>虚线为对应题型的全部记录平均分</p>
+          <p>虚线为对应题型的平均分；客观题按完整整卷统计</p>
         </div>
         <div class="chart-grid">
+          ${objectiveCardMarkup(examSubject)}
           ${SUBJECT_ORDER.map((key) => renderSubjectChart(records, SUBJECTS[key])).join("")}
         </div>
       </section>
@@ -193,5 +364,20 @@ export function renderDashboard(container, app) {
       </section>
     </div>`;
 
-  return null;
+  let disposed = false;
+  const objectiveCard = container.querySelector("[data-objective-card]");
+  if (objectiveCard) {
+    hydrateObjectiveCard(objectiveCard, examSubject, () => disposed).catch((error) => {
+      if (disposed || !objectiveCard.isConnected) return;
+      console.error(error);
+      const slot = objectiveCard.querySelector("[data-objective-chart]");
+      if (slot) {
+        slot.innerHTML = `<div class="chart-loading is-error"><p>无法读取本机整卷记录</p><span>请稍后重新打开学习总览</span></div>`;
+      }
+    });
+  }
+
+  return () => {
+    disposed = true;
+  };
 }

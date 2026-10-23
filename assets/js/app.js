@@ -10,6 +10,7 @@ import {
 import { escapeHTML, isTouchDevice } from "./utils.js";
 import { icon, toast } from "./ui.js";
 import { openSettings } from "./settings.js";
+import { initTimerWidget, pauseActiveTimer } from "./timer.js";
 import { renderDashboard } from "./views/dashboard.js";
 import { renderGrade } from "./views/grade.js";
 import { renderPapers } from "./views/papers.js";
@@ -252,12 +253,31 @@ function closeMobileNav() {
   toggle?.setAttribute("aria-expanded", "false");
 }
 
+function keepsAnswerSession(previous, next) {
+  if (!previous) return false;
+  if (
+    previous.name === "papers" &&
+    next.name === "papers" &&
+    previous.params?.paper === next.params?.paper &&
+    previous.params?.view !== "result" &&
+    next.params?.view !== "result"
+  ) {
+    return true;
+  }
+  return (
+    previous.name === "grade" &&
+    next.name === "grade" &&
+    previous.subjectKey === next.subjectKey
+  );
+}
+
 function renderRoute({ scroll = true } = {}) {
   const route = resolveRoute();
   if (route.invalid) {
     history.replaceState(null, "", "#/overview");
     route.path = "/overview";
   }
+  if (!keepsAnswerSession(activeRoute, route)) pauseActiveTimer();
   activeRoute = route;
   activeCleanup?.();
   activeCleanup = null;
@@ -325,7 +345,9 @@ async function setConfig(nextConfig) {
 function setExamSubject(nextSubject) {
   state.examSubject = saveExamSubject(normalizeExamSubject(nextSubject));
   updateExamSubjectBadge();
-  if (activeRoute?.name === "papers") renderRoute({ scroll: false });
+  if (activeRoute?.name === "papers" || activeRoute?.name === "overview") {
+    renderRoute({ scroll: false });
+  }
 }
 
 async function persistRecord(record) {
@@ -380,6 +402,7 @@ function bindShellEvents() {
 
 async function boot() {
   root.innerHTML = shellMarkup();
+  initTimerWidget();
   bindShellEvents();
   syncSidebarToggle();
   updateApiStatus();

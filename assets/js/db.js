@@ -159,6 +159,12 @@ export async function getPaperState(id) {
   return requestToPromise(transaction.objectStore(PAPER_STATE_STORE).get(id));
 }
 
+export async function listPaperStates() {
+  const database = await openDatabase();
+  const transaction = database.transaction(PAPER_STATE_STORE, "readonly");
+  return requestToPromise(transaction.objectStore(PAPER_STATE_STORE).getAll());
+}
+
 export async function savePaperState(state) {
   const database = await openDatabase();
   const transaction = database.transaction(PAPER_STATE_STORE, "readwrite");

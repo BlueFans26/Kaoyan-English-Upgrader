@@ -86,6 +86,97 @@ export function renderVocabChart(days) {
   </div>`;
 }
 
+export function renderObjectiveChart(points, { subjectName = "英语（二）", total = 60 } = {}) {
+  if (!points.length) {
+    return `<div class="chart-empty">
+      <svg class="chart-empty-line" viewBox="0 0 460 160" preserveAspectRatio="none" aria-hidden="true">
+        <line x1="0" y1="80" x2="460" y2="80" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 7" opacity=".35"/>
+        <circle cx="80" cy="80" r="3.5" fill="currentColor" opacity=".25"/>
+        <circle cx="230" cy="80" r="3.5" fill="currentColor" opacity=".25"/>
+        <circle cx="380" cy="80" r="3.5" fill="currentColor" opacity=".25"/>
+      </svg>
+      <div class="chart-empty-copy">
+        <span>尚无完整整卷记录</span>
+        <a href="#/papers">去完成一套客观题 ${iconArrow()}</a>
+      </div>
+    </div>`;
+  }
+  const chronological = [...points].sort((a, b) => a.year - b.year);
+  const average = chronological.reduce((sum, point) => sum + Number(point.score), 0) / chronological.length;
+  const width = 460;
+  const height = 208;
+  const padding = { top: 16, right: 20, bottom: 32, left: 34 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const baseline = padding.top + plotHeight;
+  const axisMax = Math.max(total, ...chronological.map((point) => Number(point.maxScore) || 0));
+  const xFor = (index) => {
+    if (chronological.length === 1) return padding.left + plotWidth / 2;
+    return padding.left + (index / (chronological.length - 1)) * plotWidth;
+  };
+  const yFor = (score) => padding.top + (1 - Number(score) / axisMax) * plotHeight;
+  const visible = chronological.map((point, index) => ({
+    x: xFor(index),
+    y: yFor(point.score),
+    ...point,
+  }));
+  const linePath = visible
+    .map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(2)},${point.y.toFixed(2)}`)
+    .join(" ");
+  const areaPath = `${linePath} L${visible.at(-1).x.toFixed(2)},${baseline} L${visible[0].x.toFixed(2)},${baseline} Z`;
+  const averageY = yFor(average).toFixed(2);
+  const gradientId = "objective-chart-gradient";
+  const tickScores = [axisMax, axisMax / 2, 0];
+  const labelIndexes = new Set([0, visible.length - 1]);
+  const labelStep = Math.max(1, Math.ceil(visible.length / 6));
+  visible.forEach((_, index) => {
+    if (index % labelStep === 0) labelIndexes.add(index);
+  });
+  const latest = visible.at(-1);
+  const formatAxis = (value) => (Number.isInteger(value) ? value : formatScore(value));
+
+  return `<div class="score-chart objective-score-chart">
+    <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHTML(subjectName)}客观题历年整卷得分曲线，共 ${chronological.length} 套完整试卷，平均 ${formatScore(average)} 分">
+      <defs>
+        <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="var(--chart-color)" stop-opacity=".18"/>
+          <stop offset="100%" stop-color="var(--chart-color)" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      ${tickScores
+        .map((tick) => {
+          const y = yFor(tick).toFixed(2);
+          return `<line class="chart-grid-line" x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}"/>
+            <text class="chart-axis-text" x="${padding.left - 8}" y="${Number(y) + 4}" text-anchor="end">${formatAxis(tick)}</text>`;
+        })
+        .join("")}
+      <line class="chart-average-line" x1="${padding.left}" y1="${averageY}" x2="${width - padding.right}" y2="${averageY}"/>
+      <rect class="chart-average-tag-bg" x="${width - padding.right - 78}" y="${Number(averageY) - 21}" width="78" height="18" rx="9"/>
+      <text class="chart-average-text" x="${width - padding.right - 7}" y="${Number(averageY) - 8}" text-anchor="end">均分 ${formatScore(average)}</text>
+      <path class="chart-area" d="${areaPath}" fill="url(#${gradientId})"/>
+      <path class="chart-line" d="${linePath}"/>
+      ${visible
+        .map(
+          (point, index) => `<g class="chart-point ${index === visible.length - 1 ? "is-latest" : ""}">
+            <circle class="chart-point-ring" cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="${index === visible.length - 1 ? 8 : 6}"/>
+            <circle class="chart-dot" cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="${index === visible.length - 1 ? 4 : 3.1}"/>
+            <title>${point.year} 年 · ${formatScore(point.score)}/${formatScore(point.maxScore)} 分 · 完整整卷</title>
+          </g>`,
+        )
+        .join("")}
+      ${[...labelIndexes]
+        .sort((a, b) => a - b)
+        .map((index) => {
+          const point = visible[index];
+          const anchor = index === 0 ? "start" : index === visible.length - 1 ? "end" : "middle";
+          return `<text class="chart-date-text" x="${point.x.toFixed(2)}" y="${height - 9}" text-anchor="${anchor}">${point.year}</text>`;
+        })
+        .join("")}
+      <circle class="chart-latest-ring" cx="${latest.x.toFixed(2)}" cy="${latest.y.toFixed(2)}" r="10"/>
+    </svg>
+  </div>`;
+}
+
 export function renderScoreChart(records, subject) {
   const scored = records.filter(
     (record) => record?.score !== null && record?.score !== undefined && Number.isFinite(Number(record.score)),

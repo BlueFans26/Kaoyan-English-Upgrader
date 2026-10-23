@@ -1,4 +1,4 @@
-const CACHE_NAME = "kao-yan-ying-yu-zong-he-bei-kao-zhan-v16";
+const CACHE_NAME = "kao-yan-ying-yu-zong-he-bei-kao-zhan-v18";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -14,6 +14,7 @@ const APP_SHELL = [
   "./assets/js/papers.js",
   "./assets/js/prompts.js",
   "./assets/js/settings.js",
+  "./assets/js/timer.js",
   "./assets/js/ui.js",
   "./assets/js/utils.js",
   "./assets/js/vocabulary.js",

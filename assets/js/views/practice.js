@@ -9,6 +9,7 @@ import {
   whyData,
 } from "../utils.js";
 import { confirmDialog, icon, initWhyPopover, toast } from "../ui.js";
+import { formatDurationLabel } from "../timer.js";
 
 function hasScore(record) {
   return record?.score !== null && record?.score !== undefined && Number.isFinite(Number(record.score));
@@ -350,6 +351,17 @@ export function renderPractice(container, app, subjectKey, params = {}) {
       ? `<div class="inline-notice is-warning">${icon("alert", 18)}<p>AI 输出达到了模型长度上限，页面已展示可解析的部分；总评、逐句明细或范文可能不完整。建议换用输出上限更高或非推理模型重新批改。</p></div>`
       : "";
   const summaryText = result.summary || "本次批改没有返回文字总评。";
+  const hasAnswerTiming = Object.prototype.hasOwnProperty.call(record, "answerDurationMs");
+  const answerDurationMs = Number(record.answerDurationMs);
+  const answerTimingMeta = !hasAnswerTiming
+    ? ""
+    : Number.isFinite(answerDurationMs) && answerDurationMs > 0
+      ? `<span class="meta-divider"></span><span class="review-time ${record.answerDurationValid === false ? "is-short" : ""}">${icon("clock", 13)} 作答 ${formatDurationLabel(answerDurationMs)}${record.answerDurationValid === false ? " · 不计有效" : ""}</span>`
+      : `<span class="meta-divider"></span><span class="review-time is-empty">${icon("clock", 13)} 作答计时未开启</span>`;
+  const answerTimingNotice =
+    hasAnswerTiming && record.answerDurationValid === false
+      ? `<div class="inline-notice is-warning review-time-warning">${icon("clock", 18)}<p>本次作答用时 ${formatDurationLabel(answerDurationMs)}，不足 5 分钟，可能为“答案对照”环节，不计为有效作答时间。</p></div>`
+      : "";
   const optimization = renderOptimization(result, subject);
   const sample = renderSample(result, subject);
   const raw = renderRaw(result);
@@ -381,6 +393,7 @@ export function renderPractice(container, app, subjectKey, params = {}) {
                 <p class="review-meta">
                   <time datetime="${escapeAttr(record.createdAt)}">${escapeHTML(formatDateTime(record.createdAt))}</time>
                   ${record.model ? `<span class="meta-divider"></span><span>${escapeHTML(record.model)}</span>` : ""}
+                  ${answerTimingMeta}
                 </p>
               </div>
               <div class="review-hero-side">
@@ -411,6 +424,7 @@ export function renderPractice(container, app, subjectKey, params = {}) {
           </section>
 
           ${renderRecordContext(record, subject)}
+          ${answerTimingNotice}
           ${parseWarning}
           ${truncatedNotice}
           ${renderSentenceTable(record, result, subject)}

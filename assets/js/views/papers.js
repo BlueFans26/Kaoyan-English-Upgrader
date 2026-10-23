@@ -6,18 +6,41 @@ import {
   normalizeExamSubject,
   papersForSubject,
 } from "../papers.js";
-import { escapeHTML, formatScore, truncate } from "../utils.js";
+import { clamp, escapeHTML, formatScore, truncate, uid } from "../utils.js";
 import { confirmDialog, icon, toast } from "../ui.js";
+import {
+  attachObjectiveTimer,
+  clearObjectiveTimer,
+  detachTimer,
+  finalizeObjectiveTimer,
+  formatClock,
+  formatDurationLabel,
+  getObjectiveSnapshot,
+  MIN_VALID_SECTION_MS,
+  PAPER_OVERTIME_MS,
+  resetObjectiveSection,
+} from "../timer.js";
 
 const PAPER_TITLE = "客观题真题";
 const HIGHLIGHT_COLORS = [
-  { key: "yellow", label: "黄色", value: "rgba(238, 197, 73, 0.36)" },
-  { key: "green", label: "绿色", value: "rgba(111, 181, 121, 0.32)" },
-  { key: "pink", label: "粉色", value: "rgba(232, 137, 155, 0.3)" },
-  { key: "blue", label: "蓝色", value: "rgba(105, 163, 214, 0.3)" },
+  { key: "yellow", label: "黄色", value: "rgba(230, 176, 32, 0.48)", ink: "#a87b08" },
+  { key: "green", label: "绿色", value: "rgba(73, 148, 91, 0.42)", ink: "#2f6a3e" },
+  { key: "pink", label: "粉色", value: "rgba(214, 86, 111, 0.4)", ink: "#9c334a" },
+  { key: "blue", label: "蓝色", value: "rgba(70, 131, 194, 0.4)", ink: "#2c5b89" },
 ];
 const DEFAULT_HIGHLIGHT_COLOR = HIGHLIGHT_COLORS[0].key;
-const HIGHLIGHT_WIDTH_RATIO = 0.016;
+const HIGHLIGHT_TOOLS = {
+  marker: { label: "荧光笔", widths: { thin: 0.01, medium: 0.016, thick: 0.024 } },
+  pen: { label: "签字笔", widths: { thin: 0.0018, medium: 0.003, thick: 0.0045 } },
+  pencil: { label: "铅笔", widths: { thin: 0.0014, medium: 0.0024, thick: 0.0036 } },
+};
+const HIGHLIGHT_WIDTH_LEVELS = [
+  { key: "thin", label: "细" },
+  { key: "medium", label: "中" },
+  { key: "thick", label: "粗" },
+];
+const DEFAULT_HIGHLIGHT_WIDTH = "medium";
+const NOTE_MAX_LENGTH = 300;
 const PARTB_SUGGESTIONS = {
   heading_matching: "先用一句话概括段落主旨，再匹配小标题，避免只抓重复词。",
   gap_fill: "关注空格前后的指代、复现和转折关系，保持段落连贯。",
@@ -36,6 +59,9 @@ function normalizePaperState(raw, id) {
       raw && typeof raw.highlights === "object" && raw.highlights
         ? raw.highlights
         : {},
+    notes: raw && typeof raw.notes === "object" && raw.notes ? raw.notes : {},
+    timing: raw && typeof raw.timing === "object" && raw.timing ? raw.timing : null,
+    summary: raw && typeof raw.summary === "object" && raw.summary ? raw.summary : null,
     updatedAt: raw?.updatedAt || null,
   };
 }
@@ -155,6 +181,7 @@ export function renderPapers(container, app, params = {}) {
   let saveChain = Promise.resolve();
   let saveErrorShown = false;
   let highlightCleanup = null;
+  let highlightApi = null;
 
   function getPart() {
     return paper?.parts.find((part) => part.key === selectedPartKey) || paper?.parts[0] || null;
@@ -227,6 +254,33 @@ export function renderPapers(container, app, params = {}) {
     };
   }
 
+  function currentTiming() {
+    const live = paper ? getObjectiveSnapshot(paper.id) : null;
+    if (live?.startedAt) return live;
+    if (paperState?.timing?.startedAt) return paperState.timing;
+    return live || paperState?.timing || null;
+  }
+
+  function writePaperSummary(timingSnapshot = null) {
+    const summary = paperSummary();
+    if (!summary.allSubmitted) {
+      paperState.summary = null;
+      return;
+    }
+    const timing = timingSnapshot?.startedAt ? timingSnapshot : currentTiming();
+    paperState.summary = {
+      score: summary.score,
+      maxScore: summary.maxScore,
+      correct: summary.correct,
+      questionCount: summary.questionCount,
+      submittedAt: new Date().toISOString(),
+      durationMs: timing?.startedAt ? Math.round(Number(timing.totalMs) || 0) : null,
+      overtime: timing?.startedAt
+        ? Math.round(Number(timing.totalMs) || 0) > PAPER_OVERTIME_MS
+        : null,
+    };
+  }
+
   function persist() {
     if (!paperState) return Promise.resolve();
     paperState.updatedAt = new Date().toISOString();
@@ -235,6 +289,9 @@ export function renderPapers(container, app, params = {}) {
       answers: JSON.parse(JSON.stringify(paperState.answers)),
       submitted: { ...paperState.submitted },
       highlights: JSON.parse(JSON.stringify(paperState.highlights)),
+      notes: JSON.parse(JSON.stringify(paperState.notes)),
+      timing: paperState.timing ? JSON.parse(JSON.stringify(paperState.timing)) : null,
+      summary: paperState.summary ? { ...paperState.summary } : null,
     };
     saveChain = saveChain
       .catch(() => {})
@@ -341,6 +398,10 @@ export function renderPapers(container, app, params = {}) {
           <span>${meta.questionCount} 题 · 60 分</span>
           <span class="paper-save-state">${summary.allSubmitted ? "整卷已提交" : summary.submittedCount ? `已提交 ${summary.submittedCount}/6 个板块` : "自动保存进度"}</span>
         </div>
+        <button type="button" class="btn btn-soft btn-small paper-notes-button" data-paper-notes-open aria-haspopup="dialog">
+          ${icon("note", 15)} 批注
+          <span class="paper-notes-count" data-paper-note-count>${allPaperNotes().length}</span>
+        </button>
         <a class="btn ${viewMode === "result" ? "btn-primary" : "btn-soft"} btn-small" href="${resultHref}" data-paper-result-link>${icon("chart", 15)} 结果页</a>
       </section>
 
@@ -371,13 +432,24 @@ export function renderPapers(container, app, params = {}) {
       ? paperState.highlights[part.key]
       : [];
     return `<div class="paper-highlight-tools" data-highlight-tools>
-      <button type="button" class="paper-hl-toggle" data-highlight-toggle aria-pressed="false" title="开启后可拖动勾画">
-        ${icon("pen", 15)}<span>荧光笔</span>
-      </button>
-      <div class="paper-hl-colors" role="group" aria-label="荧光笔颜色">
+      <div class="paper-hl-modes" role="group" aria-label="笔种">
+        <button type="button" class="paper-hl-toggle" data-highlight-toggle data-highlight-tool="marker" aria-pressed="false" title="荧光笔：拖动涂抹">
+          ${icon("highlighter", 15)}<span>荧光笔</span>
+        </button>
+        <button type="button" class="paper-hl-tool" data-highlight-tool="pen" aria-pressed="false" aria-label="签字笔" title="签字笔：细线书写">${icon("pen", 15)}</button>
+        <button type="button" class="paper-hl-tool" data-highlight-tool="pencil" aria-pressed="false" aria-label="铅笔" title="铅笔：轻笔迹">${icon("pencil", 15)}</button>
+        <button type="button" class="paper-hl-tool" data-highlight-note data-highlight-tool="note" aria-pressed="false" aria-label="文本框" title="文本框：点击文段放置">${icon("note", 15)}</button>
+      </div>
+      <div class="paper-hl-colors" role="group" aria-label="笔色">
         ${HIGHLIGHT_COLORS.map(
           (color) =>
             `<button type="button" class="paper-hl-color ${color.key === DEFAULT_HIGHLIGHT_COLOR ? "is-active" : ""}" data-highlight-color="${color.key}" style="--hl-color:${color.value}" aria-label="${color.label}荧光笔" title="${color.label}"></button>`,
+        ).join("")}
+      </div>
+      <div class="paper-hl-widths" role="group" aria-label="笔触粗细">
+        ${HIGHLIGHT_WIDTH_LEVELS.map(
+          (level) =>
+            `<button type="button" class="paper-hl-width ${level.key === DEFAULT_HIGHLIGHT_WIDTH ? "is-active" : ""}" data-highlight-width="${level.key}" aria-pressed="${level.key === DEFAULT_HIGHLIGHT_WIDTH}" aria-label="${level.label}笔触" title="${level.label}笔触"><i aria-hidden="true"></i></button>`,
         ).join("")}
       </div>
       <button type="button" class="paper-hl-tool" data-highlight-eraser aria-pressed="false" aria-label="橡皮擦" title="橡皮擦">${icon("eraser", 15)}</button>
@@ -452,9 +524,10 @@ export function renderPapers(container, app, params = {}) {
           <div class="paper-passage" data-paper-passage>
             ${body}
             <canvas class="paper-highlight-canvas" data-highlight-canvas aria-hidden="true"></canvas>
+            <div class="paper-note-layer" data-note-layer></div>
           </div>
         </div>
-        <p class="paper-highlight-hint" data-highlight-hint>${icon("info", 13)} 开启荧光笔后拖动勾画；关闭后可正常选词、点击空格。</p>
+        <p class="paper-highlight-hint" data-highlight-hint>${icon("info", 13)} 手写勾画或添加文本框；关闭工具后可正常选词、点击空格。</p>
       </div>
     </section>`;
   }
@@ -882,6 +955,109 @@ export function renderPapers(container, app, params = {}) {
     </article>`;
   }
 
+  function partTimeLabel(part) {
+    return part.kind === "partb" ? `${part.label} · ${part.partLabel}` : partTitle(part);
+  }
+
+  function timingMarkup() {
+    const timing = currentTiming();
+    if (!timing?.startedAt) {
+      return `<div class="paper-time-empty">
+        ${icon("clock", 17)}
+        <div>
+          <strong>本次作答未开启计时</strong>
+          <p>回到试卷后点击计时浮窗上的“开始计时”，即可记录本题与整卷用时；本次不计入有效作答时间。</p>
+        </div>
+      </div>`;
+    }
+    const totalMs = Math.max(0, Math.round(Number(timing.totalMs) || 0));
+    const overtime = totalMs > PAPER_OVERTIME_MS;
+    const chips = paper.parts
+      .map((part) => {
+        const entry = timing.sections?.[part.key];
+        const durationMs = Math.max(0, Math.round(Number(entry?.durationMs) || 0));
+        if (!durationMs) {
+          return `<div class="paper-time-chip is-empty">
+            <span>${escapeHTML(partTimeLabel(part))}</span>
+            <strong>未计时</strong>
+          </div>`;
+        }
+        const short = durationMs < MIN_VALID_SECTION_MS;
+        return `<div class="paper-time-chip ${short ? "is-short" : "is-valid"}">
+          <span>${escapeHTML(partTimeLabel(part))}</span>
+          <strong>${formatClock(durationMs)}</strong>
+          <small>${short ? "不足 5 分钟 · 不计有效" : "有效作答"}</small>
+        </div>`;
+      })
+      .join("");
+    const shortSections = paper.parts.filter((part) => {
+      const durationMs = Number(timing.sections?.[part.key]?.durationMs) || 0;
+      return durationMs > 0 && durationMs < MIN_VALID_SECTION_MS;
+    });
+    const warnings = [];
+    if (overtime) warnings.push("整卷用时超过 100 分钟，需注意考场时间分配。");
+    if (shortSections.length) {
+      warnings.push(
+        `${shortSections.map((part) => partTimeLabel(part)).join("、")}用时不足 5 分钟，可能为“答案对照”环节，不计入有效时间。`,
+      );
+    }
+    return `<div class="paper-time-card">
+      <div class="paper-time-total ${overtime ? "is-overtime" : "is-valid"}">
+        <span class="eyebrow">TOTAL TIME</span>
+        <strong>${formatDurationLabel(totalMs)}</strong>
+        <small>${overtime ? "已超过 100 分钟 · 不计有效时间" : "整卷有效作答时间"}</small>
+      </div>
+      <div class="paper-time-chips">${chips}</div>
+    </div>
+    ${
+      warnings.length
+        ? `<div class="paper-time-warnings">${warnings
+            .map((warning) => `<p>${icon("alert", 15)}${escapeHTML(warning)}</p>`)
+            .join("")}</div>`
+        : `<p class="paper-time-note">${icon("checkCircle", 14)} 各板块用时均不少于 5 分钟，整卷未超过 100 分钟。</p>`
+    }`;
+  }
+
+  function resultNotesMarkup() {
+    const groups = (paper?.parts || [])
+      .map((part) => ({ part, notes: notesForPart(part.key) }))
+      .filter((group) => group.notes.length);
+    if (!groups.length) return "";
+    const total = groups.reduce((sum, group) => sum + group.notes.length, 0);
+    return `<section class="paper-result-section paper-result-notes">
+      <header class="paper-result-section-head">
+        <div><span class="eyebrow">YOUR NOTES</span><h3>本卷批注</h3></div>
+        <span>共 ${total} 条 · 仅保存在本机</span>
+      </header>
+      <div class="paper-result-note-groups">
+        ${groups
+          .map(
+            (group) => `<article class="paper-result-note-group">
+              <header>
+                <div>
+                  <strong>${escapeHTML(partTitle(group.part))}</strong>
+                  <span>${group.notes.length} 条</span>
+                </div>
+                <a class="paper-result-note-group-link" href="${paperUrl(paper.id, "practice", group.part.key)}">回到本板块 ${icon("arrowRight", 13)}</a>
+              </header>
+              <ol>
+                ${group.notes
+                  .map(
+                    (note, index) => `<li class="paper-result-note-item">
+                      <span class="paper-result-note-index">${String(index + 1).padStart(2, "0")}</span>
+                      <p>${escapeHTML(note.text)}</p>
+                      <a class="paper-result-note-locate" href="${paperNoteUrl(group.part.key, note.id)}">${icon("target", 13)} 定位</a>
+                    </li>`,
+                  )
+                  .join("")}
+              </ol>
+            </article>`,
+          )
+          .join("")}
+      </div>
+    </section>`;
+  }
+
   function renderResult() {
     const summary = paperSummary();
     if (!summary.submittedCount) {
@@ -906,6 +1082,10 @@ export function renderPapers(container, app, params = {}) {
       : `已提交 ${summary.submittedCount}/6 个板块；当前分数只统计已提交部分。完成 Part B 后可整卷提交。`;
     const maxDisplay = summary.allSubmitted ? paper.maxScore : summary.maxScore;
     const scorePercent = summary.percent;
+    const timing = currentTiming();
+    const heroTime = timing?.startedAt
+      ? `<div><strong>${formatClock(timing.totalMs)}</strong><span>本卷用时</span></div>`
+      : "";
     renderShell(
       `<section class="paper-result-hero ${scoreClass(summary.score, maxDisplay)}">
         <div class="paper-result-hero-copy">
@@ -917,6 +1097,7 @@ export function renderPapers(container, app, params = {}) {
             <div><strong>${summary.answered}</strong><span>已作答题数</span></div>
             <div><strong>${summary.unanswered}</strong><span>未作答题数</span></div>
             <div><strong>${summary.submittedCount}/6</strong><span>已提交板块</span></div>
+            ${heroTime}
           </div>
         </div>
         <div class="paper-score-ring" style="--paper-score:${scorePercent}%">
@@ -932,6 +1113,13 @@ export function renderPapers(container, app, params = {}) {
           ? `<div class="paper-partial-note">${icon("info", 16)}<p>${escapeHTML(partialCopy)}</p></div>`
           : ""
       }
+      <section class="paper-result-section">
+        <header class="paper-result-section-head">
+          <div><span class="eyebrow">TIME ON TASK</span><h3>作答用时</h3></div>
+          <span>低于 5 分钟不计有效 · 超过 100 分钟视为超时</span>
+        </header>
+        ${timingMarkup()}
+      </section>
       ${weaknessList(summary)}
       <section class="paper-result-section">
         <header class="paper-result-section-head">
@@ -957,6 +1145,7 @@ export function renderPapers(container, app, params = {}) {
             .join("")}
         </div>
       </section>
+      ${resultNotesMarkup()}
       <section class="paper-result-section">
         <header class="paper-result-section-head">
           <div><span class="eyebrow">QUESTION SCORES</span><h3>各题目小分</h3></div>
@@ -994,6 +1183,30 @@ export function renderPapers(container, app, params = {}) {
   function afterRender() {
     syncSelectAvailability();
     setupHighlighter();
+    syncPaperTimer();
+  }
+
+  function syncPaperTimer() {
+    if (!paper) return;
+    const summary = paperSummary();
+    if (viewMode !== "practice" || summary.allSubmitted) {
+      detachTimer();
+      return;
+    }
+    const part = getPart();
+    attachObjectiveTimer({
+      paperId: paper.id,
+      title: `${paper.year} 年 ${examSubjectMeta(subjectKey).name} · 客观题`,
+      activePartKey: part?.key || null,
+      sectionEnabled: Boolean(part) && !isSubmitted(part),
+      parts: paper.parts.map((entry) => ({ key: entry.key, label: partTimeLabel(entry) })),
+      initialTiming: paperState.timing,
+      onCommit: (snapshot) => {
+        if (disposed || !paperState) return;
+        paperState.timing = snapshot;
+        persist();
+      },
+    });
   }
 
   function setSelectedPart(partKey) {
@@ -1084,13 +1297,46 @@ export function renderPapers(container, app, params = {}) {
     });
   }
 
-  function highlightColorValue(key) {
-    return HIGHLIGHT_COLORS.find((color) => color.key === key)?.value || HIGHLIGHT_COLORS[0].value;
+  function highlightColorValue(key, method = "marker") {
+    const color = HIGHLIGHT_COLORS.find((entry) => entry.key === key) || HIGHLIGHT_COLORS[0];
+    return method === "marker" ? color.value : color.ink;
+  }
+
+  function normalizeNoteRecord(entry) {
+    if (!entry || typeof entry !== "object") return null;
+    const x = Number(entry.x);
+    const y = Number(entry.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return {
+      id: typeof entry.id === "string" && entry.id ? entry.id : uid("note"),
+      x: clamp(x, 0, 1),
+      y: clamp(y, 0, 1),
+      text: String(entry.text || "").slice(0, NOTE_MAX_LENGTH),
+    };
+  }
+
+  function notesForPart(partKey) {
+    const raw = paperState?.notes?.[partKey];
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map(normalizeNoteRecord)
+      .filter((note) => note && note.text.trim());
+  }
+
+  function allPaperNotes() {
+    return (paper?.parts || []).flatMap((part) =>
+      notesForPart(part.key).map((note) => ({ part, note })),
+    );
+  }
+
+  function paperNoteUrl(sectionKey, noteId) {
+    return `${paperUrl(paper.id, "practice", sectionKey)}&note=${encodeURIComponent(noteId)}`;
   }
 
   function teardownHighlighter() {
     highlightCleanup?.();
     highlightCleanup = null;
+    highlightApi = null;
   }
 
   function setupHighlighter() {
@@ -1099,7 +1345,8 @@ export function renderPapers(container, app, params = {}) {
     const shell = container.querySelector("[data-highlight-shell]");
     const passage = shell?.querySelector("[data-paper-passage]");
     const canvas = shell?.querySelector("[data-highlight-canvas]");
-    if (!shell || !passage || !canvas) return;
+    const noteLayer = shell?.querySelector("[data-note-layer]");
+    if (!shell || !passage || !canvas || !noteLayer) return;
     const context = canvas.getContext("2d");
     if (!context) return;
     const localController = new AbortController();
@@ -1107,6 +1354,7 @@ export function renderPapers(container, app, params = {}) {
       active: false,
       mode: "marker",
       color: DEFAULT_HIGHLIGHT_COLOR,
+      width: DEFAULT_HIGHLIGHT_WIDTH,
       drawing: false,
       erasing: false,
       stroke: null,
@@ -1114,14 +1362,56 @@ export function renderPapers(container, app, params = {}) {
     let strokes = Array.isArray(paperState.highlights[part.key])
       ? JSON.parse(JSON.stringify(paperState.highlights[part.key]))
       : [];
+    let notes = (Array.isArray(paperState.notes[part.key]) ? paperState.notes[part.key] : [])
+      .map(normalizeNoteRecord)
+      .filter(Boolean);
+    const noteElements = new Map();
     let resizeObserver = null;
     let frame = 0;
+    let noteSaveTimer = 0;
 
     function persistHighlights() {
       paperState.highlights[part.key] = strokes;
       persist();
       const status = shell.querySelector("[data-highlight-status]");
       if (status) status.textContent = strokes.length ? `${strokes.length} 笔勾画` : "勾画会保存在本机";
+    }
+
+    function updateNoteCounters() {
+      let total = notes.filter((note) => note.text.trim()).length;
+      for (const entry of paper.parts) {
+        if (entry.key === part.key) continue;
+        total += notesForPart(entry.key).length;
+      }
+      container.querySelectorAll("[data-paper-note-count]").forEach((node) => {
+        node.textContent = String(total);
+      });
+    }
+
+    function syncNoteTexts() {
+      for (const entry of noteElements.values()) {
+        if (!entry.el.classList.contains("is-editing")) continue;
+        const value = entry.textarea.value || entry.note.text || "";
+        entry.note.text = value.slice(0, NOTE_MAX_LENGTH);
+      }
+    }
+
+    function persistNotes() {
+      syncNoteTexts();
+      paperState.notes[part.key] = notes
+        .filter((note) => note.text.trim())
+        .map((note) => ({ id: note.id, x: note.x, y: note.y, text: note.text }));
+      persist();
+      updateNoteCounters();
+    }
+
+    function schedulePersistNotes() {
+      updateNoteCounters();
+      if (noteSaveTimer) clearTimeout(noteSaveTimer);
+      noteSaveTimer = setTimeout(() => {
+        noteSaveTimer = 0;
+        persistNotes();
+      }, 220);
     }
 
     function setStatus(text) {
@@ -1135,20 +1425,40 @@ export function renderPapers(container, app, params = {}) {
       });
     }
 
+    function activeWidthButton() {
+      shell.querySelectorAll("[data-highlight-width]").forEach((button) => {
+        const active = button.dataset.highlightWidth === tool.width;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
+    }
+
     function setToolButtons() {
-      const toggle = shell.querySelector("[data-highlight-toggle]");
+      shell.querySelectorAll("[data-highlight-tool]").forEach((button) => {
+        const active = tool.active && button.dataset.highlightTool === tool.mode;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
       const eraser = shell.querySelector("[data-highlight-eraser]");
-      toggle?.classList.toggle("is-active", tool.active && tool.mode === "marker");
-      toggle?.setAttribute("aria-pressed", String(tool.active && tool.mode === "marker"));
-      eraser?.classList.toggle("is-active", tool.active && tool.mode === "eraser");
-      eraser?.setAttribute("aria-pressed", String(tool.active && tool.mode === "eraser"));
-      shell.classList.toggle("is-drawing", tool.active);
+      const erasing = tool.active && tool.mode === "eraser";
+      eraser?.classList.toggle("is-active", erasing);
+      eraser?.setAttribute("aria-pressed", String(erasing));
+      const drawing = tool.active && ["marker", "pen", "pencil", "eraser"].includes(tool.mode);
+      shell.classList.toggle("is-drawing", drawing);
+      shell.classList.toggle("is-erasing", erasing);
+      shell.classList.toggle("is-note-mode", tool.active && tool.mode === "note");
       const hint = shell.querySelector("[data-highlight-hint]");
       if (hint) {
         hint.classList.toggle("is-active", tool.active);
-        hint.innerHTML = tool.active
-          ? `${icon("pen", 13)} 勾画中：拖动涂抹；点击工具按钮退出后可正常答题。`
-          : `${icon("info", 13)} 开启荧光笔后拖动勾画；关闭后可正常选词、点击空格。`;
+        if (tool.active && tool.mode === "note") {
+          hint.innerHTML = `${icon("note", 13)} 点击文段放置文本框；编辑后点击其他区域即固定保存。`;
+        } else if (tool.active) {
+          const label = tool.mode === "eraser" ? "橡皮擦" : HIGHLIGHT_TOOLS[tool.mode]?.label || "手写";
+          const hintIcon = tool.mode === "pencil" ? "pencil" : tool.mode === "eraser" ? "eraser" : "pen";
+          hint.innerHTML = `${icon(hintIcon, 13)} ${label}已开启：拖动${tool.mode === "eraser" ? "擦除笔迹" : "书写"}；点击工具按钮退出后可正常答题。`;
+        } else {
+          hint.innerHTML = `${icon("info", 13)} 手写勾画或添加文本框；关闭工具后可正常选词、点击空格。`;
+        }
       }
     }
 
@@ -1156,7 +1466,18 @@ export function renderPapers(container, app, params = {}) {
       tool.active = active;
       if (mode) tool.mode = mode;
       if (active) tool.color = tool.color || DEFAULT_HIGHLIGHT_COLOR;
+      if (!active) {
+        tool.drawing = false;
+        tool.erasing = false;
+        tool.stroke = null;
+        scheduleRedraw();
+      }
       setToolButtons();
+    }
+
+    function chooseTool(mode) {
+      if (tool.active && tool.mode === mode) setActive(false);
+      else setActive(true, mode);
     }
 
     function resizeCanvas() {
@@ -1175,27 +1496,46 @@ export function renderPapers(container, app, params = {}) {
 
     function drawStroke(stroke, rect) {
       if (!stroke?.points?.length) return;
-      const width = Math.max(8, (Number(stroke.width) || HIGHLIGHT_WIDTH_RATIO) * rect.width);
-      context.strokeStyle = highlightColorValue(stroke.color);
-      context.fillStyle = highlightColorValue(stroke.color);
+      const method = HIGHLIGHT_TOOLS[stroke.tool] ? stroke.tool : "marker";
+      const fallbackWidth = HIGHLIGHT_TOOLS[method].widths.medium;
+      const width = Math.max(
+        method === "marker" ? 5 : 1,
+        (Number(stroke.width) || fallbackWidth) * rect.width,
+      );
+      context.save();
+      context.strokeStyle = highlightColorValue(stroke.color, method);
+      context.fillStyle = highlightColorValue(stroke.color, method);
       context.lineWidth = width;
       context.lineCap = "round";
       context.lineJoin = "round";
+      if (method === "pencil") context.globalAlpha = 0.58;
+      const trace = () => {
+        context.beginPath();
+        stroke.points.forEach(([x, y], index) => {
+          const px = x * rect.width;
+          const py = y * rect.height;
+          if (index === 0) context.moveTo(px, py);
+          else context.lineTo(px, py);
+        });
+      };
       if (stroke.points.length === 1) {
         const [x, y] = stroke.points[0];
         context.beginPath();
         context.arc(x * rect.width, y * rect.height, width / 2, 0, Math.PI * 2);
         context.fill();
+        context.restore();
         return;
       }
-      context.beginPath();
-      stroke.points.forEach(([x, y], index) => {
-        const px = x * rect.width;
-        const py = y * rect.height;
-        if (index === 0) context.moveTo(px, py);
-        else context.lineTo(px, py);
-      });
+      trace();
       context.stroke();
+      if (method === "pencil") {
+        context.globalAlpha = 0.22;
+        context.lineWidth = Math.max(0.8, width * 0.55);
+        context.translate(0.5, 0.4);
+        trace();
+        context.stroke();
+      }
+      context.restore();
     }
 
     function redraw() {
@@ -1268,10 +1608,236 @@ export function renderPapers(container, app, params = {}) {
       }
     }
 
+    function placeNote(note, element, updateData = false) {
+      const rect = passage.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const maxLeft = Math.max(0, rect.width - element.offsetWidth - 6);
+      const maxTop = Math.max(0, rect.height - element.offsetHeight - 6);
+      const left = Math.min(maxLeft, Math.max(0, note.x * rect.width));
+      const top = Math.min(maxTop, Math.max(0, note.y * rect.height));
+      element.style.left = `${left}px`;
+      element.style.top = `${top}px`;
+      if (updateData) {
+        note.x = left / rect.width;
+        note.y = top / rect.height;
+      }
+    }
+
+    function layoutNotes() {
+      for (const entry of noteElements.values()) placeNote(entry.note, entry.el, false);
+    }
+
+    function focusNote(noteId) {
+      const entry = noteElements.get(String(noteId));
+      if (!entry) return false;
+      entry.el.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+      clearTimeout(entry.flashTimer);
+      entry.el.classList.remove("is-flashing");
+      void entry.el.offsetWidth;
+      entry.el.classList.add("is-flashing");
+      entry.flashTimer = setTimeout(() => {
+        entry.el.classList.remove("is-flashing");
+      }, 1600);
+      return true;
+    }
+
+    function autosizeNote(textarea) {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.min(160, Math.max(44, textarea.scrollHeight))}px`;
+    }
+
+    function renderNoteText(entry) {
+      const empty = !entry.note.text.trim();
+      entry.textEl.textContent = empty
+        ? "空白批注，点击编辑按钮继续输入。"
+        : entry.note.text;
+      entry.textEl.classList.toggle("is-empty", empty);
+      entry.el.classList.toggle("is-empty", empty);
+    }
+
+    function setNoteEditing(entry, editing, { focus = false, save = true } = {}) {
+      if (editing) {
+        entry.el.classList.add("is-editing");
+        entry.textarea.value = entry.note.text;
+        autosizeNote(entry.textarea);
+        placeNote(entry.note, entry.el, true);
+        if (focus) {
+          requestAnimationFrame(() => {
+            if (disposed) return;
+            entry.textarea.focus({ preventScroll: true });
+            const end = entry.textarea.value.length;
+            entry.textarea.setSelectionRange?.(end, end);
+          });
+        }
+        return;
+      }
+      const value = entry.textarea.value || entry.note.text || "";
+      entry.note.text = value.trimEnd().slice(0, NOTE_MAX_LENGTH);
+      entry.el.classList.remove("is-editing");
+      renderNoteText(entry);
+      placeNote(entry.note, entry.el, true);
+      if (save) persistNotes();
+    }
+
+    function startNoteEditing(entry) {
+      setNoteEditing(entry, true, { focus: true, save: false });
+    }
+
+    function finishNoteEditing(entry) {
+      if (!entry) return;
+      setNoteEditing(entry, false, { save: true });
+    }
+
+    function removeNote(noteId) {
+      const entry = noteElements.get(noteId);
+      if (!entry) return;
+      notes = notes.filter((note) => note.id !== noteId);
+      clearTimeout(entry.flashTimer);
+      entry.el.remove();
+      noteElements.delete(noteId);
+      if (noteSaveTimer) {
+        clearTimeout(noteSaveTimer);
+        noteSaveTimer = 0;
+      }
+      persistNotes();
+    }
+
+    function startNoteDrag(note, element, event) {
+      if (event.button > 0 || event.target.closest("button")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const handle = event.currentTarget;
+      const rect = passage.getBoundingClientRect();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startLeft = element.offsetLeft;
+      const startTop = element.offsetTop;
+      const maxLeft = Math.max(0, rect.width - element.offsetWidth);
+      const maxTop = Math.max(0, rect.height - element.offsetHeight);
+      element.classList.add("is-dragging");
+      handle.setPointerCapture?.(event.pointerId);
+      const onMove = (moveEvent) => {
+        const left = Math.min(maxLeft, Math.max(0, startLeft + moveEvent.clientX - startX));
+        const top = Math.min(maxTop, Math.max(0, startTop + moveEvent.clientY - startY));
+        element.style.left = `${left}px`;
+        element.style.top = `${top}px`;
+        note.x = rect.width ? left / rect.width : note.x;
+        note.y = rect.height ? top / rect.height : note.y;
+      };
+      const onEnd = () => {
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onEnd);
+        handle.removeEventListener("pointercancel", onEnd);
+        element.classList.remove("is-dragging");
+        persistNotes();
+      };
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onEnd);
+      handle.addEventListener("pointercancel", onEnd);
+    }
+
+    function addNoteElement(note, { editing = false } = {}) {
+      const element = document.createElement("div");
+      element.className = "paper-note";
+      element.dataset.noteId = note.id;
+      element.innerHTML = `<div class="paper-note-head" data-note-drag>
+        <span class="paper-note-grip">${icon("grip", 13)}</span>
+        <span class="paper-note-title">批注</span>
+        <span class="paper-note-actions">
+          <button type="button" class="paper-note-action paper-note-done" data-note-done aria-label="完成编辑" title="完成">${icon("check", 12)}</button>
+          <button type="button" class="paper-note-action paper-note-edit" data-note-edit aria-label="编辑批注" title="编辑">${icon("pencil", 12)}</button>
+          <button type="button" class="paper-note-action paper-note-remove" data-note-remove aria-label="删除批注" title="删除批注">${icon("trash", 12)}</button>
+        </span>
+      </div>
+      <textarea class="paper-note-input" data-note-input maxlength="${NOTE_MAX_LENGTH}" rows="2" aria-label="批注内容" placeholder="写下达题痕迹…"></textarea>
+      <div class="paper-note-text" data-note-text></div>`;
+      noteLayer.append(element);
+      const textarea = element.querySelector("[data-note-input]");
+      const textEl = element.querySelector("[data-note-text]");
+      const head = element.querySelector("[data-note-drag]");
+      const doneButton = element.querySelector("[data-note-done]");
+      const editButton = element.querySelector("[data-note-edit]");
+      const removeButton = element.querySelector("[data-note-remove]");
+      const entry = { note, el: element, textarea, textEl, flashTimer: 0 };
+      noteElements.set(note.id, entry);
+      textarea.value = note.text;
+      renderNoteText(entry);
+      if (editing) {
+        setNoteEditing(entry, true, { focus: true, save: false });
+      } else {
+        element.classList.remove("is-editing");
+        autosizeNote(textarea);
+        placeNote(note, element, true);
+      }
+      const syncFromTextarea = () => {
+        note.text = textarea.value.slice(0, NOTE_MAX_LENGTH);
+        autosizeNote(textarea);
+        placeNote(note, element, true);
+        schedulePersistNotes();
+      };
+      textarea.addEventListener("input", syncFromTextarea, {
+        signal: localController.signal,
+      });
+      textarea.addEventListener("compositionend", syncFromTextarea, {
+        signal: localController.signal,
+      });
+      textarea.addEventListener(
+        "blur",
+        () => {
+          finishNoteEditing(entry);
+        },
+        { signal: localController.signal },
+      );
+      textarea.addEventListener(
+        "keydown",
+        (event) => {
+          if (event.key === "Escape" || ((event.ctrlKey || event.metaKey) && event.key === "Enter")) {
+            event.preventDefault();
+            event.stopPropagation();
+            textarea.blur();
+          }
+        },
+        { signal: localController.signal },
+      );
+      head.addEventListener(
+        "pointerdown",
+        (event) => startNoteDrag(note, element, event),
+        { signal: localController.signal },
+      );
+      doneButton.addEventListener(
+        "click",
+        (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          finishNoteEditing(entry);
+        },
+        { signal: localController.signal },
+      );
+      editButton.addEventListener(
+        "click",
+        (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startNoteEditing(entry);
+        },
+        { signal: localController.signal },
+      );
+      removeButton.addEventListener(
+        "click",
+        (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          removeNote(note.id);
+        },
+        { signal: localController.signal },
+      );
+      return entry;
+    }
+
     canvas.addEventListener(
       "pointerdown",
       (event) => {
-        if (!tool.active || event.button > 0) return;
+        if (!tool.active || tool.mode === "note" || event.button > 0) return;
         event.preventDefault();
         canvas.setPointerCapture?.(event.pointerId);
         const point = pointFromEvent(event);
@@ -1279,10 +1845,12 @@ export function renderPapers(container, app, params = {}) {
           tool.erasing = true;
           eraseAt(point);
         } else {
+          const method = HIGHLIGHT_TOOLS[tool.mode] ? tool.mode : "marker";
           tool.drawing = true;
           tool.stroke = {
             color: tool.color,
-            width: HIGHLIGHT_WIDTH_RATIO,
+            tool: method,
+            width: HIGHLIGHT_TOOLS[method].widths[tool.width] || HIGHLIGHT_TOOLS[method].widths.medium,
             points: [point],
           };
           scheduleRedraw();
@@ -1315,17 +1883,34 @@ export function renderPapers(container, app, params = {}) {
       canvas.addEventListener(type, endStroke, { signal: localController.signal });
     });
 
-    shell.querySelector("[data-highlight-toggle]")?.addEventListener(
+    passage.addEventListener(
       "click",
-      () => {
-        if (tool.active && tool.mode === "marker") {
-          setActive(false);
-        } else {
-          setActive(true, "marker");
-        }
+      (event) => {
+        if (!tool.active || tool.mode !== "note") return;
+        if (event.target.closest("button, a, input, select, textarea, .paper-note")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const [x, y] = pointFromEvent(event);
+        const note = { id: uid("note"), x, y, text: "" };
+        notes.push(note);
+        addNoteElement(note, { editing: true });
+        setActive(false);
       },
       { signal: localController.signal },
     );
+
+    shell.querySelectorAll("[data-highlight-tool]").forEach((button) => {
+      button.addEventListener(
+        "click",
+        () => {
+          const mode = button.dataset.highlightTool;
+          if (!mode) return;
+          if (mode !== "note" && !HIGHLIGHT_TOOLS[mode]) return;
+          chooseTool(mode);
+        },
+        { signal: localController.signal },
+      );
+    });
 
     shell.querySelectorAll("[data-highlight-color]").forEach((button) => {
       button.addEventListener(
@@ -1333,7 +1918,25 @@ export function renderPapers(container, app, params = {}) {
         () => {
           tool.color = button.dataset.highlightColor || DEFAULT_HIGHLIGHT_COLOR;
           activeColorButton();
-          setActive(true, "marker");
+          if (!tool.active || tool.mode === "note" || tool.mode === "eraser") {
+            setActive(true, "marker");
+          }
+        },
+        { signal: localController.signal },
+      );
+    });
+
+    shell.querySelectorAll("[data-highlight-width]").forEach((button) => {
+      button.addEventListener(
+        "click",
+        () => {
+          const width = button.dataset.highlightWidth;
+          if (!HIGHLIGHT_WIDTH_LEVELS.some((level) => level.key === width)) return;
+          tool.width = width;
+          activeWidthButton();
+          if (!tool.active || tool.mode === "note" || tool.mode === "eraser") {
+            setActive(true, "marker");
+          }
         },
         { signal: localController.signal },
       );
@@ -1342,11 +1945,7 @@ export function renderPapers(container, app, params = {}) {
     shell.querySelector("[data-highlight-eraser]")?.addEventListener(
       "click",
       () => {
-        if (tool.active && tool.mode === "eraser") {
-          setActive(false);
-        } else {
-          setActive(true, "eraser");
-        }
+        chooseTool("eraser");
       },
       { signal: localController.signal },
     );
@@ -1373,8 +1972,8 @@ export function renderPapers(container, app, params = {}) {
           return;
         }
         const confirmed = await confirmDialog({
-          title: "清空荧光笔勾画",
-          message: "将清除本板块的全部勾画，且无法恢复。作答不会受影响。",
+          title: "清空手写勾画",
+          message: "将清除本板块的全部手写勾画，且无法恢复。作答与文本框不会受影响。",
           confirmText: "清空勾画",
           danger: true,
         });
@@ -1386,20 +1985,74 @@ export function renderPapers(container, app, params = {}) {
       { signal: localController.signal },
     );
 
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key === "Escape" && tool.active && tool.mode === "note") {
+          setActive(false);
+        }
+      },
+      { signal: localController.signal },
+    );
+
     if ("ResizeObserver" in window) {
-      resizeObserver = new ResizeObserver(() => scheduleRedraw());
+      resizeObserver = new ResizeObserver(() => {
+        scheduleRedraw();
+        layoutNotes();
+      });
       resizeObserver.observe(passage);
     }
-    window.addEventListener("resize", scheduleRedraw, { signal: localController.signal });
-    document.fonts?.ready?.then(() => scheduleRedraw()).catch(() => {});
+    window.addEventListener(
+      "resize",
+      () => {
+        scheduleRedraw();
+        layoutNotes();
+      },
+      { signal: localController.signal },
+    );
+    const flushNotesOnLeave = () => {
+      syncNoteTexts();
+      persistNotes();
+    };
+    window.addEventListener("pagehide", flushNotesOnLeave, {
+      signal: localController.signal,
+    });
+    document.addEventListener(
+      "visibilitychange",
+      () => {
+        if (document.visibilityState === "hidden") flushNotesOnLeave();
+      },
+      { signal: localController.signal },
+    );
+    document.fonts?.ready?.then(() => {
+      if (disposed) return;
+      scheduleRedraw();
+      layoutNotes();
+    }).catch(() => {});
+    for (const note of notes) addNoteElement(note);
+    updateNoteCounters();
     redraw();
     setToolButtons();
     activeColorButton();
+    activeWidthButton();
+    highlightApi = {
+      focusNote,
+      flushNotes: () => {
+        syncNoteTexts();
+        persistNotes();
+      },
+    };
 
     highlightCleanup = () => {
+      syncNoteTexts();
+      persistNotes();
       localController.abort();
+      if (noteSaveTimer) clearTimeout(noteSaveTimer);
+      noteSaveTimer = 0;
       resizeObserver?.disconnect();
       if (frame) cancelAnimationFrame(frame);
+      for (const entry of noteElements.values()) clearTimeout(entry.flashTimer);
+      noteElements.clear();
       canvas.width = 0;
       canvas.height = 0;
     };
@@ -1420,6 +2073,11 @@ export function renderPapers(container, app, params = {}) {
     if (!confirmed || disposed) return;
     paperState.answers[part.key] = answerMap(part, true);
     paperState.submitted[part.key] = true;
+    if (paperSummary().allSubmitted) {
+      const snapshot = finalizeObjectiveTimer(paper.id);
+      if (snapshot?.startedAt) paperState.timing = snapshot;
+      writePaperSummary(snapshot);
+    }
     persist();
     const scrollY = window.scrollY;
     render();
@@ -1430,6 +2088,10 @@ export function renderPapers(container, app, params = {}) {
   async function submitPaper() {
     if (disposed || !paper) return;
     if (paperSummary().allSubmitted) {
+      const live = getObjectiveSnapshot(paper.id);
+      const snapshot = live ? finalizeObjectiveTimer(paper.id) : paperState.timing;
+      if (snapshot?.startedAt) paperState.timing = snapshot;
+      writePaperSummary(snapshot);
       await persist();
       if (!disposed) navigatePaper(paper.id, "result");
       return;
@@ -1452,6 +2114,9 @@ export function renderPapers(container, app, params = {}) {
       paperState.answers[part.key] = answerMap(part, true);
       paperState.submitted[part.key] = true;
     });
+    const snapshot = finalizeObjectiveTimer(paper.id);
+    if (snapshot?.startedAt) paperState.timing = snapshot;
+    writePaperSummary(snapshot);
     await persist();
     if (disposed) return;
     navigatePaper(paper.id, "result");
@@ -1467,8 +2132,28 @@ export function renderPapers(container, app, params = {}) {
       confirmText: "重做",
     });
     if (!confirmed || disposed) return;
+    const timing = currentTiming();
+    const sectionMs = Number(timing?.sections?.[part.key]?.durationMs) || 0;
     delete paperState.answers[part.key];
     delete paperState.submitted[part.key];
+    const live = getObjectiveSnapshot(paper.id);
+    if (live) {
+      resetObjectiveSection(paper.id, part.key);
+      const snapshot = getObjectiveSnapshot(paper.id);
+      if (snapshot?.startedAt) paperState.timing = snapshot;
+    } else if (paperState.timing?.startedAt) {
+      const sections = { ...(paperState.timing.sections || {}) };
+      delete sections[part.key];
+      const totalMs = Math.max(0, (Number(paperState.timing.totalMs) || 0) - sectionMs);
+      paperState.timing = {
+        ...paperState.timing,
+        updatedAt: new Date().toISOString(),
+        totalMs,
+        totalValid: totalMs > 0 ? totalMs <= PAPER_OVERTIME_MS : null,
+        sections,
+      };
+    }
+    paperState.summary = null;
     persist();
     render();
     toast("本板块已重置，可以重新作答。");
@@ -1482,8 +2167,11 @@ export function renderPapers(container, app, params = {}) {
       danger: true,
     });
     if (!confirmed || disposed) return;
+    clearObjectiveTimer(paper.id);
     paperState.answers = {};
     paperState.submitted = {};
+    paperState.timing = null;
+    paperState.summary = null;
     await persist();
     if (disposed) return;
     navigatePaper(paper.id, "practice", "cloze");
@@ -1500,6 +2188,105 @@ export function renderPapers(container, app, params = {}) {
       "button[data-paper-answer], select[data-paper-select]",
     );
     focusable?.focus({ preventScroll: true });
+  }
+
+  function openNoteLocation(partKey, noteId) {
+    if (!paper) return;
+    if (viewMode === "practice" && selectedPartKey === partKey) {
+      highlightApi?.focusNote?.(noteId);
+      return;
+    }
+    location.hash = paperNoteUrl(partKey, noteId);
+  }
+
+  function goToSection(partKey) {
+    if (!paper) return;
+    if (viewMode === "practice" && selectedPartKey === partKey) {
+      container
+        .querySelector("[data-highlight-shell]")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    navigatePaper(paper.id, "practice", partKey);
+  }
+
+  function openNotesDialog() {
+    highlightApi?.flushNotes?.();
+    const groups = (paper?.parts || [])
+      .map((part) => ({ part, notes: notesForPart(part.key) }))
+      .filter((group) => group.notes.length);
+    const total = groups.reduce((sum, group) => sum + group.notes.length, 0);
+    container.ownerDocument
+      .querySelectorAll(".paper-notes-modal")
+      .forEach((node) => node.remove());
+    const dialog = document.createElement("dialog");
+    dialog.className = "modal paper-notes-modal";
+    dialog.innerHTML = `<div class="modal-card paper-notes-card">
+      <header class="paper-notes-head">
+        <div>
+          <span class="eyebrow">YOUR NOTES</span>
+          <h2>本卷批注</h2>
+          <p>共 ${total} 条 · 批注只保存在本机，可随时回到原文继续编辑</p>
+        </div>
+        <button type="button" class="icon-btn modal-close" data-notes-close aria-label="关闭">${icon("x", 19)}</button>
+      </header>
+      <div class="paper-notes-body">
+        ${
+          groups.length
+            ? groups
+                .map(
+                  (group) => `<section class="paper-notes-group">
+                    <header>
+                      <div class="paper-notes-group-title">
+                        <strong>${escapeHTML(partTitle(group.part))}</strong>
+                        <span>${group.notes.length} 条</span>
+                      </div>
+                      <a class="paper-notes-section-link" href="${paperUrl(paper.id, "practice", group.part.key)}" data-notes-section="${group.part.key}">进入本板块 ${icon("arrowRight", 13)}</a>
+                    </header>
+                    <ol>
+                      ${group.notes
+                        .map(
+                          (note, index) => `<li class="paper-notes-item">
+                            <span class="paper-notes-index">${String(index + 1).padStart(2, "0")}</span>
+                            <p>${escapeHTML(note.text)}</p>
+                            <button type="button" class="btn btn-soft btn-small paper-notes-locate" data-notes-locate="${escapeHTML(note.id)}" data-notes-part="${group.part.key}">${icon("target", 13)} 定位</button>
+                          </li>`,
+                        )
+                        .join("")}
+                    </ol>
+                  </section>`,
+                )
+                .join("")
+            : `<div class="paper-notes-empty">
+                <span>${icon("note", 24)}</span>
+                <strong>还没有保存的批注</strong>
+                <p>在阅读材料工具栏选择「文本框」，点击文段放置便签；编辑后点击其他区域，便签会固定并自动保存。</p>
+              </div>`
+        }
+      </div>
+    </div>`;
+    dialog.addEventListener("close", () => dialog.remove());
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog || event.target.closest("[data-notes-close]")) {
+        dialog.close();
+        return;
+      }
+      const locate = event.target.closest("[data-notes-locate]");
+      if (locate) {
+        dialog.close();
+        openNoteLocation(locate.dataset.notesPart, locate.dataset.notesLocate);
+        return;
+      }
+      const sectionLink = event.target.closest("[data-notes-section]");
+      if (sectionLink) {
+        event.preventDefault();
+        dialog.close();
+        goToSection(sectionLink.dataset.notesSection);
+      }
+    });
+    container.ownerDocument.body.appendChild(dialog);
+    dialog.showModal();
+    dialog.querySelector("[data-notes-close]")?.focus();
   }
 
   async function init() {
@@ -1522,11 +2309,21 @@ export function renderPapers(container, app, params = {}) {
       viewMode = params.view === "result" ? "result" : "practice";
       paperState = normalizePaperState(await getPaperState(paper.id), paper.id);
       if (disposed) return;
+      if (!paperState.summary && paperSummary().allSubmitted) {
+        writePaperSummary(paperState.timing);
+        persist();
+      }
       const expected = paperUrl(paper.id, viewMode, selectedPartKey);
       if (location.hash !== expected) {
         history.replaceState(null, "", expected);
       }
       render();
+      if (params.note) {
+        const noteId = String(params.note);
+        window.setTimeout(() => {
+          if (!disposed) highlightApi?.focusNote?.(noteId);
+        }, 80);
+      }
     } catch (error) {
       if (disposed) return;
       console.error(error);
@@ -1539,6 +2336,11 @@ export function renderPapers(container, app, params = {}) {
     async (event) => {
       if (event.target.closest("[data-papers-retry]")) {
         init();
+        return;
+      }
+      if (event.target.closest("[data-paper-notes-open]")) {
+        event.preventDefault();
+        openNotesDialog();
         return;
       }
       const resultLink = event.target.closest("[data-paper-result-link]");
@@ -1628,5 +2430,6 @@ export function renderPapers(container, app, params = {}) {
     disposed = true;
     controller.abort();
     teardownHighlighter();
+    detachTimer();
   };
 }
